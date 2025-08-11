@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import argparse
+import subprocess
+import re
+from pathlib import Path
+
+class ProjectHandler:
+    """Base class for project type handlers"""
+    
+    def detect(self):
+        """Return True if this handler can handle the current project"""
+        raise NotImplementedError
+    
+    def find_entry_point(self):
+        """Find the main entry point for this project type"""
+        raise NotImplementedError
+    
+    def detect_port(self, entry_point=None):
+        """Detect the port this project should run on"""
+        raise NotImplementedError
+    
+    def get_install_cmd(self):
+        """Get command to install dependencies"""
+        raise NotImplementedError
+    
+    def setup_cache(self):
+        """Setup project-specific cache directory"""
+        raise NotImplementedError
+    
+    def build_docker_cmd(self, entry_point, port, version=None):
+        """Build the Docker command for this project type"""
+        raise NotImplementedError
+
+class PythonHandler(ProjectHandler):
+    def detect(self):
+        cwd = Path.cwd()
+        python_files = ['requirements.txt', 'pyproject.toml', 'setup.py', 'Pipfile', 'poetry.lock']
+        return any((cwd / file).exists() for file in python_files)
+    
+    def find_entry_point(self):
+        cwd = Path.cwd()
+        entry_points = ['main.py', 'app.py', 'server.py', 'run.py', 'manage.py', 'start.py', 'api.py']
+        
+        for entry in entry_points:
+            if (cwd / entry).exists():
+                return entry
+                
+        # Look for any .py file that imports Flask, FastAPI, etc.
+        for py_file in cwd.glob('*.py'):
+            try:
+                content = py_file.read_text()
+                if any(framework in content.lower() for framework in ['flask', 'fastapi', 'django']):
+                    return py_file.name
+            except:
+                continue
+                
+        return None
+    
+    def detect_port(self, entry_point=None):
+        if not entry_point:
+            return 5000
+            
+        try:
+            content = Path(entry_point).read_text()
+            port_patterns = [
+                r'port\s*=\s*(\d+)',
+                r'PORT\s*=\s*(\d+)', 
+                r':(\d{4,5})',
+                r'\.run\([^)]*port\s*=\s*(\d+)',
+            ]
+            
+            for pattern in port_patterns:
+                match = re.search(pattern, content)
+                if match:
+                    return int(match.group(1))
+        except:
+            pass
+            
+        return 5000
+    
+    def get_install_cmd(self):
+        cwd = Path.cwd()
+        if (cwd / 'requirements.txt').exists():
+            return 'pip install -r requirements.txt'
+        elif (cwd / 'pyproject.toml').exists():
+            return 'pip install .'
+        elif (cwd / 'setup.py').exists():
+            return 'pip install .'
+        return ''
+    
+    def setup_cache(self):
+        cache_dir = Path.cwd() / '.pip-cache'
+        cache_dir.mkdir(exist_ok=True)
+        
+        gitignore = Path.cwd() / '.gitignore'
+        if gitignore.exists():
+            gitignore_content = gitignore.read_text()
+            if '.pip-cache/' not in gitignore_content:
+                with gitignore.open('a') as f:
+                    f.write('\n.pip-cache/\n')
+        
+        return cache_dir
+    
+    def build_docker_cmd(self, entry_point, port, version='3.11'):
+        cwd = Path.cwd()
+        cache_dir = self.setup_cache()
+        install_cmd = self.get_install_cmd()
+        
+        docker_parts = [
+            'docker', 'run', '--rm', '-it',
+            f'-p', f'{port}:{port}',
+            '-v', f'{cwd}:/app',
+            '-v', f'{cache_dir}:/root/.cache/pip',
+            '-w', '/app',
+            '-e', 'FLASK_RUN_HOST=0.0.0.0',
+            '-e', 'HOST=0.0.0.0',
+            f'python:{version}',
+            'bash', '-c'
+        ]
+        
+        bash_cmd_parts = []
+        if install_cmd:
+            bash_cmd_parts.append(install_cmd)
+        
+        if 'manage.py' in entry_point:  # Django
+            bash_cmd_parts.append(f'python {entry_point} runserver 0.0.0.0:{port}')
+        else:  # Flask, FastAPI, etc.
+            bash_cmd_parts.append(f'python {entry_point} --host=0.0.0.0 --port={port} || python {entry_point}')
+        
+        bash_cmd = ' && '.join(bash_cmd_parts)
+        docker_parts.append(bash_cmd)
+        
+        return docker_parts
+
+class NodeJSHandler(ProjectHandler):
+    def detect(self):
+        cwd = Path.cwd()
+        nodejs_files = ['package.json', 'package-lock.json', 'yarn.lock']
+        return any((cwd / file).exists() for file in nodejs_files)
+    
+    def find_entry_point(self):
+        cwd = Path.cwd()
+        package_json = cwd / 'package.json'
+        
+        if package_json.exists():
+            try:
+                import json
+                data = json.loads(package_json.read_text())
+                
+                # Check if this is a Next.js project first
+                is_nextjs = False
+                if 'scripts' in data:
+                    scripts = data['scripts']
+                    is_nextjs = ('next' in str(scripts) or 
+                               (cwd / 'next.config.js').exists() or 
+                               (cwd / 'next.config.mjs').exists())
+                
+                if is_nextjs:
+                    # Always use dev for Next.js to avoid build requirement
+                    if 'scripts' in data and 'dev' in data['scripts']:
+                        return "npm run dev"
+                        
+                # For non-Next.js projects
+                if 'scripts' in data:
+                    scripts = data['scripts']
+                    if 'start' in scripts:
+                        return "npm run start"
+                    elif 'dev' in scripts:
+                        return "npm run dev"
+                    
+                # Then check main field
+                if 'main' in data:
+                    return f"node {data['main']}"
+            except:
+                pass
+        
+        # Common entry point files
+        entry_points = ['index.js', 'server.js', 'app.js', 'main.js', 'start.js', 'api.js']
+        for entry in entry_points:
+            if (cwd / entry).exists():
+                return f"node {entry}"
+                
+        return None
+    
+    def detect_port(self, entry_point=None):
+        cwd = Path.cwd()
+        
+        # Check package.json for port config
+        package_json = cwd / 'package.json'
+        if package_json.exists():
+            try:
+                import json
+                data = json.loads(package_json.read_text())
+                if 'config' in data and 'port' in data['config']:
+                    return int(data['config']['port'])
+            except:
+                pass
+        
+        # Check common files for port patterns
+        files_to_check = ['index.js', 'server.js', 'app.js', 'main.js']
+        
+        for file in files_to_check:
+            filepath = cwd / file
+            if filepath.exists():
+                try:
+                    content = filepath.read_text()
+                    port_patterns = [
+                        r'port\s*=\s*(\d+)',
+                        r'PORT\s*=\s*(\d+)',
+                        r'process\.env\.PORT\s*\|\|\s*(\d+)',
+                        r'\.listen\(\s*(\d{4,5})',
+                    ]
+                    
+                    for pattern in port_patterns:
+                        match = re.search(pattern, content)
+                        if match:
+                            return int(match.group(1))
+                except:
+                    continue
+                    
+        return 3000
+    
+    def get_install_cmd(self):
+        cwd = Path.cwd()
+        if (cwd / 'yarn.lock').exists():
+            return 'yarn install'
+        elif (cwd / 'package.json').exists():
+            return 'npm install'
+        return ''
+    
+    def setup_cache(self):
+        cache_dir = Path.cwd() / '.npm-cache'
+        cache_dir.mkdir(exist_ok=True)
+        
+        gitignore = Path.cwd() / '.gitignore'
+        if gitignore.exists():
+            gitignore_content = gitignore.read_text()
+            if '.npm-cache/' not in gitignore_content:
+                with gitignore.open('a') as f:
+                    f.write('\n.npm-cache/\n')
+        
+        return cache_dir
+    
+    def build_docker_cmd(self, entry_command, port, version='18'):
+        cwd = Path.cwd()
+        cache_dir = self.setup_cache()
+        install_cmd = self.get_install_cmd()
+        
+        docker_parts = [
+            'docker', 'run', '--rm', '-it',
+            f'-p', f'{port}:{port}',
+            '-v', f'{cwd}:/app',
+            '-v', f'{cache_dir}:/root/.npm',
+            '-w', '/app',
+            '-e', f'PORT={port}',
+            '-e', f'HOST=0.0.0.0',
+            f'node:{version}',
+            'bash', '-c'
+        ]
+        
+        bash_cmd_parts = []
+        if install_cmd:
+            bash_cmd_parts.append(install_cmd)
+        
+        bash_cmd_parts.append(entry_command)
+        
+        bash_cmd = ' && '.join(bash_cmd_parts)
+        docker_parts.append(bash_cmd)
+        
+        return docker_parts
+
+# Registry of all handlers
+HANDLERS = [
+    PythonHandler(),
+    NodeJSHandler(),
+]
+
+def detect_project_type():
+    """Detect the type of project in current directory"""
+    for handler in HANDLERS:
+        if handler.detect():
+            return handler
+    return None
+
+def run_docker_command(cmd_parts):
+    """Execute the Docker command"""
+    print("Running command:")
+    print(' '.join(cmd_parts))
+    print("\n" + "="*50)
+    
+    try:
+        subprocess.run(cmd_parts)
+    except KeyboardInterrupt:
+        print("\nStopped by user")
+    except Exception as e:
+        print(f"Error: {e}")
+
+def main():
+    parser = argparse.ArgumentParser(description='Run any project in Docker ad-hoc')
+    parser.add_argument('--port', type=int, help='Override port number')
+    parser.add_argument('--entry', help='Override entry point file/command')
+    parser.add_argument('--python-version', default='3.11', help='Python version to use')
+    parser.add_argument('--node-version', default='18', help='Node.js version to use')
+    parser.add_argument('--dry-run', action='store_true', help='Show command without running')
+    
+    args = parser.parse_args()
+    
+    # Detect project type
+    handler = detect_project_type()
+    
+    if not handler:
+        print("Error: No recognized project files found")
+        sys.exit(1)
+    
+    # Find entry point
+    entry_point = args.entry or handler.find_entry_point()
+    if not entry_point:
+        print(f"Error: Could not find entry point for {handler.__class__.__name__}")
+        sys.exit(1)
+    
+    # Detect port
+    port = args.port or handler.detect_port(entry_point)
+    
+    # Get version argument based on handler type
+    if isinstance(handler, PythonHandler):
+        version = args.python_version
+        project_type = "Python"
+    elif isinstance(handler, NodeJSHandler):
+        version = args.node_version
+        project_type = "Node.js"
+    else:
+        version = None
+        project_type = "Unknown"
+    
+    print(f"Detected: {project_type} project")
+    print(f"Entry point: {entry_point}")
+    print(f"Port: {port}")
+    print()
+    
+    # Build and run Docker command
+    cmd_parts = handler.build_docker_cmd(entry_point, port, version)
+    
+    if args.dry_run:
+        print("Would run:")
+        print(' '.join(cmd_parts))
+    else:
+        run_docker_command(cmd_parts)
+
+if __name__ == '__main__':
+    main()
